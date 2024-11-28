@@ -662,7 +662,7 @@ class GaussianDiffusion1D(Module):
     def sample(self, batch_size = 16, condition=None):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, seq_length), condition)
+        return sample_fn((batch_size, channels, seq_length), condition=condition)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5, condition=None):
@@ -898,11 +898,11 @@ class Trainer1D(object):
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                        #     all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n,condition=condition), batches))
 
-                        all_samples = torch.cat(all_samples_list, dim = 0)
+                        # all_samples = torch.cat(all_samples_list, dim = 0)
 
-                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        # torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
                         self.save(milestone)
 
                 pbar.update(1)
