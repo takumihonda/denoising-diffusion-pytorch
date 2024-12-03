@@ -95,7 +95,10 @@ class ConditionalDataset1D(Dataset):
         return len(self.tensor)
 
     def __getitem__(self, idx):
-        return self.tensor[idx].clone(), self.condition[idx].clone()
+#        ic(self.tensor.shape, )
+        # [dim,channles,time_steps]
+#        return self.tensor[idx].clone(), self.condition[idx].clone()
+        return self.tensor[idx,:,:].clone(), self.condition[idx,:,:].clone()
 
 # small helper modules
 
@@ -564,7 +567,7 @@ class GaussianDiffusion1D(Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False, condition=None):
-        model_output = self.model(x, t, x_self_cond, condition)
+        model_output = self.model(x, t, x_self_cond, condition=condition)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -662,7 +665,8 @@ class GaussianDiffusion1D(Module):
     def sample(self, batch_size = 16, condition=None):
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, seq_length), condition=condition)
+        dim = condition.shape[2]
+        return sample_fn((batch_size, 1, dim), condition=condition)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5, condition=None):
@@ -708,12 +712,11 @@ class GaussianDiffusion1D(Module):
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t, condition).pred_x_start
+                x_self_cond = self.model_predictions(x, t, condition=condition).pred_x_start
                 x_self_cond.detach_()
 
         # predict and take gradient step
-
-        model_out = self.model(x, t, x_self_cond, condition)
+        model_out = self.model(x, t, x_self_cond, condition=condition)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -731,13 +734,12 @@ class GaussianDiffusion1D(Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
-        b, c, n, device, seq_length, = *img.shape, img.device, self.seq_length
-        assert n == seq_length, f'seq length must be {seq_length}'
+    def forward(self, img, condition, *args, **kwargs):
+        (b, c, dim_), device, seq_length, = img.shape, img.device, self.seq_length
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t, condition=condition, *args, **kwargs)
 
 # trainer class
 
@@ -861,6 +863,7 @@ class Trainer1D(object):
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
+            loss_l = []
             while self.step < self.train_num_steps:
                 self.model.train()
 
@@ -879,6 +882,7 @@ class Trainer1D(object):
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
+                loss_l.append(total_loss)
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -906,5 +910,8 @@ class Trainer1D(object):
                         self.save(milestone)
 
                 pbar.update(1)
-
+        print()
+        print('Loss')
+        print(loss_l)
+        print()
         accelerator.print('training complete')
