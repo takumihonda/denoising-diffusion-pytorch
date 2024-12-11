@@ -762,7 +762,9 @@ class Trainer1D(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        vdataset = None, # validation dataset
+        validation_batch_step = 100,
     ):
         super().__init__()
 
@@ -796,6 +798,14 @@ class Trainer1D(object):
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
+        
+        if vdataset is not None:
+            assert validation_batch_step > 0, 'validation step must be greater than 0'
+            self.validation_batch_step = validation_batch_step
+            self.vdataset = vdataset
+            vdl = DataLoader(vdataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+            vdl = self.accelerator.prepare(vdl)
+            self.vdl = cycle(vdl)
 
         # optimizer
 
@@ -863,7 +873,8 @@ class Trainer1D(object):
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
-            loss_l = []
+            loss_l  = [] # training loss
+            vloss_l = [] # validation loss
             while self.step < self.train_num_steps:
                 self.model.train()
 
@@ -910,8 +921,34 @@ class Trainer1D(object):
                         self.save(milestone)
 
                 pbar.update(1)
+                
+                if self.vdataset is not None:
+                    self.model.eval()
+                    vstep = 0
+                    vtotal_loss = 0.0
+                    with torch.no_grad():
+                        for vstep in range(self.validation_batch_step):
+                            vdata, vcondition = next(self.vdl)
+                            vdata      = vdata.to(device)
+                            vcondition = vcondition.to(device)
+                    
+                            with self.accelerator.autocast():
+                                vloss = self.model(vdata, condition=vcondition)
+                                vloss = vloss / self.validation_batch_step
+                                vtotal_loss += vloss.item()
+                        vloss_l.append(vtotal_loss)
+
+
+
         print()
         print('Loss')
-        print(loss_l)
+        if len(loss_l) > 10:
+            for i, loss_ in enumerate( loss_l[0::10] ):
+                if self.vdataset is not None:
+                    print('Loss: {0:.3f}, Validation Loss: {1:.3f}, Step: {2:05}'.format(loss_, vloss_l[i],i))
+                else:  
+                    print('Loss: {0:.3f}, Step: {1:05}'.format(loss_, i))
+        else:    
+            print(loss_l)
         print()
         accelerator.print('training complete')
