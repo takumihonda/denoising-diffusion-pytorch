@@ -868,6 +868,9 @@ class Trainer1D(object):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
     def train(self):
+        import numpy as np
+        #from git import Repo
+        
         accelerator = self.accelerator
         device = accelerator.device
 
@@ -950,5 +953,10 @@ class Trainer1D(object):
                     print('Loss: {0:.3f}, Step: {1:05}'.format(loss_, i))
         else:    
             print(loss_l)
+        np.savez(str(self.results_folder)+'/loss.npz',loss=np.array(loss_l),vloss=np.array(vloss_l))
         print()
+        # repo = Repo(".")
+        # commit_id = repo.head.commit.hexsha
+        # pritn(commit_id)
+        
         accelerator.print('training complete')
