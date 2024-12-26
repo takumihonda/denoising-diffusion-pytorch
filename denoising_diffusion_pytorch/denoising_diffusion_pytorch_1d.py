@@ -136,6 +136,33 @@ class PreNorm(Module):
     def forward(self, x):
         x = self.norm(x)
         return self.fn(x)
+    
+# spatial positional embeds
+class SpatialPosEmb(Module):
+    def __init__(self, dim=64, max_length=40):
+        super().__init__()
+        self.dim = dim
+        self.max_length = max_length
+                
+        position = torch.arange(max_length)        # (max_length,)
+        pos = 2 * math.pi * position / max_length  # (max_length,)
+        pos = pos.unsqueeze(1)                     # (max_length,1)
+        
+        half_dim = dim // 2
+        
+        freq = torch.arange(1, half_dim + 1).unsqueeze(0)  # (1, half_dim)
+
+        # pos * freq -> (max_length, half_dim)
+        pe_sin = torch.sin(pos * freq)  # (max_length, half_dim)
+        pe_cos = torch.cos(pos * freq)  # (max_length, half_dim)
+
+        pe = torch.cat([pe_sin, pe_cos], dim=1)  # (max_length, dim)
+        self.register_buffer('positional_embedding', pe)  # (max_length, dim)
+
+    def forward(self,length):
+        pe = self.positional_embedding[:length, :]  # (length, dim)
+        return pe
+    
 
 # sinusoidal positional embeds
 
@@ -291,7 +318,11 @@ class Unet1D(Module):
         learned_sinusoidal_dim = 16,
         sinusoidal_pos_emb_theta = 10000,
         attn_dim_head = 32,
-        attn_heads = 4
+        attn_heads = 4, 
+        use_spatial_embedding = False,
+        max_length = 40, # spatial embedding
+        spatial_pos_emb_dim = 128,        # spatial embedding dim
+        spatial_pos_emb_hidden_dim = 128, # spatial embedding hidden dim
     ):
         super().__init__()
 
@@ -368,6 +399,19 @@ class Unet1D(Module):
 
         self.final_res_block = resnet_block(init_dim * 2, init_dim)
         self.final_conv = nn.Conv1d(init_dim, self.out_dim, 1)
+        
+        # spatial embedding
+        self.use_spatial_embedding = use_spatial_embedding
+        self.max_length = max_length
+        if self.use_spatial_embedding:
+            self.spatial_embedding = SpatialPosEmb(dim=spatial_pos_emb_dim, max_length = self.max_length)
+            self.spatial_mlp = nn.Sequential(
+                nn.Linear(spatial_pos_emb_dim, spatial_pos_emb_hidden_dim),
+                nn.GELU(),
+                nn.Linear(spatial_pos_emb_hidden_dim, spatial_pos_emb_dim)
+            )
+
+            self.to_input_channels = nn.Conv1d(spatial_pos_emb_dim, input_channels, 1)
 
     def forward(self, x, time, x_self_cond = None, condition=None):
         if self.self_condition:
@@ -377,6 +421,14 @@ class Unet1D(Module):
         if self.conditioned:
             # embed condition here!
             x = torch.cat((condition, x), dim = 1)
+            
+        if self.use_spatial_embedding:
+            b, c, n = x.shape
+            pos_emb = self.spatial_embedding(n)           # [dim,channels]
+            pos_emb = self.spatial_mlp(pos_emb)[None,:,:] # [1,dim,channles]
+            pos_emb = pos_emb.permute(0, 2, 1)            # [1,channels,dim]
+            pos_emb = self.to_input_channels(pos_emb)
+            x = x + pos_emb
 
         x = self.init_conv(x)
         r = x.clone()
@@ -450,7 +502,11 @@ class GaussianDiffusion1D(Module):
         objective = 'pred_noise',
         beta_schedule = 'cosine',
         ddim_sampling_eta = 0.,
-        auto_normalize = True
+        auto_normalize = True,
+        loss_type = 'l1',
+        tf_loss_alpha = 1.0,
+        tf_loss_gamma = 2.0,
+        tf_loss_threshold = None,
     ):
         super().__init__()
         self.model = model
@@ -463,6 +519,13 @@ class GaussianDiffusion1D(Module):
 
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
+        # loss
+        self.loss_type = loss_type 
+        self.tf_loss_alpha = tf_loss_alpha
+        self.tf_loss_gamma = tf_loss_gamma
+        self.tf_loss_threshold = tf_loss_threshold
+        
+        
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
         elif beta_schedule == 'cosine':
@@ -728,11 +791,18 @@ class GaussianDiffusion1D(Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = F.mse_loss(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
+        if self.loss_type == 'l1':
+            loss = F.mse_loss(model_out, target, reduction = 'none')
+            loss = reduce(loss, 'b ... -> b', 'mean')
 
-        loss = loss * extract(self.loss_weight, t, loss.shape)
-        return loss.mean()
+            loss = loss * extract(self.loss_weight, t, loss.shape)
+            loss = loss.mean()
+        elif self.loss_type == 'tail':
+            loss = self.tail_focused_loss(model_out, target)
+        else:
+            raise ValueError(f'invalid loss type {self.loss_type}')
+            
+        return loss
 
     def forward(self, img, condition, *args, **kwargs):
         (b, c, dim_), device, seq_length, = img.shape, img.device, self.seq_length
@@ -740,6 +810,36 @@ class GaussianDiffusion1D(Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, condition=condition, *args, **kwargs)
+
+    def tail_focused_loss(self, pred, target):
+        """
+        loss(i) = w_i * (error_i^2)
+
+        w_i = 1 + alpha * (|error_i|^gamma)  
+
+        Args:
+            pred (Tensor): 
+            target (Tensor):
+        Returns:
+            loss (Tensor): 
+        """
+        # absolute error
+        error = torch.abs(pred - target)
+        base_mse = error ** 2
+
+        if self.tf_loss_threshold is None:
+            # simple:  w_i = 1 + alpha*(|error|^gamma)
+            weights = 1.0 + self.tf_loss_alpha * (error ** self.tf_loss_gamma)
+        else:
+            # with threshold: 
+            # e.g.,: w_i = 1 + alpha * ((error - threshold)^gamma) for error >= threshold
+            mask = (error >= self.tf_loss_threshold).float()
+            tail_error = torch.relu(error - self.tf_loss_threshold)  # larger than threshold            weights = 1.0 + self.alpha * (tail_error ** self.gamma) * mask
+
+        # loss
+        loss = weights * base_mse
+        return loss.mean()
+
 
 # trainer class
 
